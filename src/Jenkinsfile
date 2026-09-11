@@ -1,0 +1,281 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    environment {
+        APP_NAME       = 'web-application'
+        K8S_NAMESPACE  = 'default'
+        DEPLOYMENT     = 'web-application'
+        CONTAINER_NAME = 'web-application'
+        REGISTRY       = 'docker.io'
+        IMAGE_REPO     = 'ankya2295/web-application'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+
+                script {
+                    env.GIT_SHA = sh(
+                        script: 'git rev-parse --short=8 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_SHA}"
+                    env.IMAGE = "${env.IMAGE_REPO}:${env.IMAGE_TAG}"
+                }
+
+                echo "Building immutable image ${env.IMAGE}"
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh 'npm ci'
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh 'npm run build'
+            }
+        }
+
+        stage('Test') {
+            steps {
+                sh 'npm test'
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh '''
+                    set -eu
+                    docker build \
+                      --label org.opencontainers.image.revision="${GIT_SHA}" \
+                      --label org.opencontainers.image.version="${IMAGE_TAG}" \
+                      --tag "${IMAGE}" \
+                      .
+                '''
+            }
+        }
+
+        stage('Container Smoke Test') {
+            steps {
+                sh '''
+                    set -eu
+
+                    container_name="${APP_NAME}-test-${BUILD_NUMBER}"
+
+                    cleanup() {
+                      docker rm -f "${container_name}" >/dev/null 2>&1 || true
+                    }
+
+                    trap cleanup EXIT
+
+                    docker run -d \
+                      --name "${container_name}" \
+                      -e APP_VERSION="${IMAGE_TAG}" \
+                      -p 127.0.0.1::3000 \
+                      "${IMAGE}"
+
+                    host_port="$(docker port "${container_name}" 3000/tcp | head -1 | awk -F: '{print $NF}')"
+
+                    success=false
+                    for attempt in $(seq 1 30); do
+                      if curl --fail --silent \
+                        "http://127.0.0.1:${host_port}/health" |
+                        grep -F "${IMAGE_TAG}" >/dev/null; then
+                        success=true
+                        break
+                      fi
+
+                      sleep 2
+                    done
+
+                    if [ "${success}" != "true" ]; then
+                      docker logs "${container_name}"
+                      exit 1
+                    fi
+                '''
+            }
+        }
+
+        stage('Push Image') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-credentials',
+                        usernameVariable: 'REGISTRY_USER',
+                        passwordVariable: 'REGISTRY_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set +x
+                        printf '%s' "${REGISTRY_TOKEN}" |
+                          docker login "${REGISTRY}" \
+                            --username "${REGISTRY_USER}" \
+                            --password-stdin
+
+                        docker push "${IMAGE}"
+                        docker logout "${REGISTRY}"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: 'kubeconfig-credentials',
+                        variable: 'KUBECONFIG_FILE'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        export KUBECONFIG="${KUBECONFIG_FILE}"
+
+                        kubectl apply -f kubernetes/service.yaml
+                        kubectl apply -f kubernetes/deployment.yaml
+
+                        kubectl -n "${K8S_NAMESPACE}" set image \
+                          deployment/"${DEPLOYMENT}" \
+                          "${CONTAINER_NAME}"="${IMAGE}"
+
+                        kubectl -n "${K8S_NAMESPACE}" set env \
+                          deployment/"${DEPLOYMENT}" \
+                          APP_VERSION="${IMAGE_TAG}"
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Rollout') {
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: 'kubeconfig-credentials',
+                        variable: 'KUBECONFIG_FILE'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        export KUBECONFIG="${KUBECONFIG_FILE}"
+
+                        kubectl -n "${K8S_NAMESPACE}" rollout status \
+                          deployment/"${DEPLOYMENT}" \
+                          --timeout=180s
+
+                        actual_image="$(kubectl -n "${K8S_NAMESPACE}" \
+                          get deployment "${DEPLOYMENT}" \
+                          -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${CONTAINER_NAME}"'")].image}')"
+
+                        test "${actual_image}" = "${IMAGE}"
+
+                        kubectl -n "${K8S_NAMESPACE}" get deployment "${DEPLOYMENT}"
+                        kubectl -n "${K8S_NAMESPACE}" get pods \
+                          -l app="${APP_NAME}" \
+                          -o wide
+                    '''
+                }
+            }
+        }
+
+        stage('Application Verification') {
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: 'kubeconfig-credentials',
+                        variable: 'KUBECONFIG_FILE'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        export KUBECONFIG="${KUBECONFIG_FILE}"
+
+                        log_file="$(mktemp)"
+                        kubectl -n "${K8S_NAMESPACE}" port-forward \
+                          service/web-application-service \
+                          18080:80 >"${log_file}" 2>&1 &
+                        pf_pid=$!
+
+                        cleanup() {
+                          kill "${pf_pid}" >/dev/null 2>&1 || true
+                          wait "${pf_pid}" >/dev/null 2>&1 || true
+                          rm -f "${log_file}"
+                        }
+
+                        trap cleanup EXIT
+
+                        success=false
+                        for attempt in $(seq 1 30); do
+                          if curl --fail --silent \
+                            [127.0.0.1](http://127.0.0.1:18080/health) |
+                            grep -F "${IMAGE_TAG}" >/dev/null; then
+                            success=true
+                            break
+                          fi
+
+                          sleep 2
+                        done
+
+                        if [ "${success}" != "true" ]; then
+                          cat "${log_file}"
+                          kubectl -n "${K8S_NAMESPACE}" get pods
+                          exit 1
+                        fi
+
+                        curl --fail --silent \
+                          [127.0.0.1](http://127.0.0.1:18080/)
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            script {
+                if (env.IMAGE_TAG?.trim()) {
+                    withCredentials([
+                        file(
+                            credentialsId: 'kubeconfig-credentials',
+                            variable: 'KUBECONFIG_FILE'
+                        )
+                    ]) {
+                        sh '''
+                            set +e
+                            export KUBECONFIG="${KUBECONFIG_FILE}"
+
+                            echo "Pipeline failed. Inspecting deployment..."
+                            kubectl -n "${K8S_NAMESPACE}" get deployment "${DEPLOYMENT}"
+                            kubectl -n "${K8S_NAMESPACE}" get pods \
+                              -l app="${APP_NAME}" \
+                              -o wide
+                            kubectl -n "${K8S_NAMESPACE}" describe deployment "${DEPLOYMENT}"
+
+                            echo "Rolling back to the preceding Kubernetes revision..."
+                            kubectl -n "${K8S_NAMESPACE}" rollout undo \
+                              deployment/"${DEPLOYMENT}"
+                            kubectl -n "${K8S_NAMESPACE}" rollout status \
+                              deployment/"${DEPLOYMENT}" \
+                              --timeout=180s
+                        '''
+                    }
+                }
+            }
+        }
+
+        always {
+            sh 'docker image rm "${IMAGE}" >/dev/null 2>&1 || true'
+            deleteDir()
+        }
+    }
+}
