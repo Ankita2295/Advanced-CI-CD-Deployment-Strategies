@@ -1,0 +1,7 @@
+{
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "jest --runInBand",
+    "build": "echo \"Build completed\""
+  }
+}
